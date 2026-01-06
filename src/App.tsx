@@ -16,7 +16,14 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 
 import { fetchSunTimes } from "./api/sunrise";
-import { fetchCurrentTemperature } from "./api/weather";
+import {
+  fetchAirQualityIndex,
+  fetchCurrentTemperature,
+  fetchWeatherDetails,
+  fetchWeeklyForecast,
+  type DailyForecast,
+  type WeatherDetails
+} from "./api/weather";
 import { cancelSunriseAlarm, ensureNotificationPermissions, scheduleSunriseAlarm } from "./services/alarm";
 import { loadSettings, saveSettings, type SavedLocation } from "./services/storage";
 import { addMinutes, formatTime, formatTimeLabel, formatTimeRange } from "./utils/time";
@@ -27,8 +34,17 @@ const DEFAULT_LOCATION: SavedLocation = {
   label: "San Francisco"
 };
 
+const WEEKDAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"] as const;
+const WEEKDAYS_FULL = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
+
+const WEATHER_ICON_SIZE = 110;
 const SUN_DOT_SIZE = 14;
-const COMPASS_OFFSET_X = 6;
+const COMPASS_OFFSET_X = 0;
+const COMPASS_TICK_RADIUS = 0.88;
+const COMPASS_LABEL_RADIUS = 0.78;
+const COMPASS_CARDINAL_GAP = 100;
+const COMPASS_CARDINAL_SIZE = 15;
+
 
 type Screen = "main" | "weather" | "sun";
 
@@ -51,6 +67,10 @@ export default function App() {
   const [temperatureUnitPreference, setTemperatureUnitPreference] = useState<"C" | "F">("F");
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [weatherError, setWeatherError] = useState<string | null>(null);
+  const [weeklyForecast, setWeeklyForecast] = useState<DailyForecast[]>([]);
+  const [weatherDetails, setWeatherDetails] = useState<WeatherDetails | null>(null);
+  const [weatherCode, setWeatherCode] = useState<number | null>(null);
+  const [weatherIsDay, setWeatherIsDay] = useState<boolean | null>(null);
   const [bgMode, setBgMode] = useState<"bg1" | "bg2">("bg1");
   const [locationModalOpen, setLocationModalOpen] = useState(false);
   const [customLocationQuery, setCustomLocationQuery] = useState("");
@@ -105,6 +125,86 @@ export default function App() {
     return `${Math.round(value)}°${temperatureUnitPreference}`;
   }, [temperature, temperatureUnit, temperatureUnitPreference]);
 
+  const todayLabel = useMemo(() => WEEKDAYS_FULL[new Date().getDay()], []);
+
+  const forecastItems = useMemo(() => {
+    if (!weeklyForecast.length) return [];
+
+    const sourceUnit = weeklyForecast[0]?.unit && weeklyForecast[0].unit.toUpperCase().includes("F") ? "F" : "C";
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return weeklyForecast
+      .map((day) => {
+        const date = new Date(`${day.date}T00:00:00`);
+        const avg = (day.temperatureMax + day.temperatureMin) / 2;
+        let temperature = avg;
+        if (sourceUnit !== temperatureUnitPreference) {
+          temperature = sourceUnit === "C" ? (temperature * 9) / 5 + 32 : ((temperature - 32) * 5) / 9;
+        }
+        return {
+          key: day.date,
+          dayLabel: WEEKDAYS[date.getDay()],
+          date,
+          temperature: Math.round(temperature)
+        };
+      })
+      .filter((item) => item.date.getTime() > today.getTime())
+      .sort((a, b) => a.date.getTime() - b.date.getTime())
+      .slice(0, 6);
+  }, [weeklyForecast, temperatureUnitPreference]);
+
+  const weatherIcon = useMemo(() => {
+    if (weatherCode === null) {
+      return { name: "cloud" as const, label: "Weather" };
+    }
+
+    const isDay = weatherIsDay !== false;
+
+    if (weatherCode === 0 || weatherCode === 1) {
+      return { name: isDay ? "sunny" : "moon", label: "Clear" } as const;
+    }
+
+    if (weatherCode === 2) {
+      return { name: isDay ? "partly-sunny" : "cloudy-night", label: "Partly cloudy" } as const;
+    }
+
+    if (weatherCode === 3 || weatherCode === 45 || weatherCode === 48) {
+      return { name: "cloud" as const, label: "Cloudy" };
+    }
+
+    if (
+      (weatherCode >= 51 && weatherCode <= 67) ||
+      (weatherCode >= 80 && weatherCode <= 82)
+    ) {
+      return { name: "rainy" as const, label: "Rain" };
+    }
+
+    if ((weatherCode >= 71 && weatherCode <= 77) || (weatherCode >= 85 && weatherCode <= 86)) {
+      return { name: "snow" as const, label: "Snow" };
+    }
+
+    if (weatherCode >= 95 && weatherCode <= 99) {
+      return { name: "thunderstorm" as const, label: "Thunderstorm" };
+    }
+
+    return { name: "cloud" as const, label: "Weather" };
+  }, [weatherCode, weatherIsDay]);
+
+  const weatherDetailLabels = useMemo(() => {
+    const precip = weatherDetails?.precipitationProbability;
+    const wind = weatherDetails?.windSpeed;
+    const windUnit = weatherDetails?.windUnit ?? "km/h";
+    const airQuality = weatherDetails?.airQuality;
+
+    return {
+      precipitation: typeof precip === "number" ? `${Math.round(precip)}%` : "--",
+      wind: typeof wind === "number" ? `${Math.round(wind)} ${windUnit}` : "--",
+      airQuality: typeof airQuality === "number" ? `${Math.round(airQuality)} AQI` : "--"
+    };
+  }, [weatherDetails]);
+
   const compassRotation = useMemo(() => {
     if (heading === null) return 0;
     return (90 - heading + 360) % 360;
@@ -126,8 +226,8 @@ export default function App() {
   const compassMarks = useMemo(() => {
     if (!compassSize) return { ticks: [], labels: [] as Array<{ deg: number; left: number; top: number }> };
     const radius = compassSize / 2;
-    const tickRadius = radius * 0.78;
-    const labelRadius = radius * 0.68;
+    const tickRadius = radius * COMPASS_TICK_RADIUS;
+    const labelRadius = radius * COMPASS_LABEL_RADIUS;
     const ticks: Array<{ key: string; left: number; top: number; size: number; major: boolean }> = [];
     const labels: Array<{ deg: number; left: number; top: number }> = [];
 
@@ -153,21 +253,23 @@ export default function App() {
   const compassCardinalStyle = useMemo(() => {
     if (!compassSize) return null;
     const radius = compassSize / 2;
-    const labelRadius = radius * 0.68;
-    const cardinalRadius = labelRadius + 28;
-    const halfSize = 9;
-    const centerY = radius - halfSize;
+    const tickRadius = radius * COMPASS_TICK_RADIUS;
+    const halfSize = COMPASS_CARDINAL_SIZE / 2;
+    const maxRadius = radius - halfSize - 2;
+    const cardinalRadius = Math.min(tickRadius + COMPASS_CARDINAL_GAP, maxRadius);
+    const center = radius - halfSize;
     return {
-      north: { left: radius - cardinalRadius - halfSize, top: centerY },
-      south: { left: radius + cardinalRadius - halfSize, top: centerY }
+      east: { left: center, top: radius - cardinalRadius - halfSize },
+      west: { left: center, top: radius + cardinalRadius - halfSize },
+      north: { left: radius - cardinalRadius - halfSize, top: center },
+      south: { left: radius + cardinalRadius - halfSize, top: center }
     };
   }, [compassSize]);
 
   const compassBeamStyle = useMemo(() => {
     if (!compassSize) return null;
     const radius = compassSize / 2;
-    const labelRadius = radius * 0.68;
-    const beamHeight = Math.max(0, labelRadius - 12);
+    const beamHeight = Math.max(0, radius * 0.7 - 6);
     const halfWidth = beamHeight * 0.45;
     return {
       borderLeftWidth: halfWidth,
@@ -485,18 +587,61 @@ export default function App() {
 
     setWeatherLoading(true);
     setWeatherError(null);
+    setWeeklyForecast([]);
+    setWeatherDetails(null);
+    setWeatherCode(null);
+    setWeatherIsDay(null);
 
-    fetchCurrentTemperature(location.latitude, location.longitude)
-      .then((result) => {
+    Promise.allSettled([
+      fetchCurrentTemperature(location.latitude, location.longitude),
+      fetchWeeklyForecast(location.latitude, location.longitude),
+      fetchWeatherDetails(location.latitude, location.longitude),
+      fetchAirQualityIndex(location.latitude, location.longitude)
+    ])
+      .then(([currentResult, forecastResult, detailsResult, airQualityResult]) => {
         if (!active) return;
-        setTemperature(result.temperature);
-        setTemperatureUnit(result.unit);
-      })
-      .catch((e: any) => {
-        if (!active) return;
-        setWeatherError(e?.message ?? "Failed to load temperature.");
-        setTemperature(null);
-        setTemperatureUnit(null);
+
+        if (currentResult.status === "fulfilled") {
+          setTemperature(currentResult.value.temperature);
+          setTemperatureUnit(currentResult.value.unit);
+          setWeatherCode(currentResult.value.weatherCode);
+          setWeatherIsDay(currentResult.value.isDay);
+        } else {
+          setWeatherError(currentResult.reason?.message ?? "Failed to load temperature.");
+          setTemperature(null);
+          setTemperatureUnit(null);
+          setWeatherCode(null);
+          setWeatherIsDay(null);
+        }
+
+        if (forecastResult.status === "fulfilled") {
+          setWeeklyForecast(forecastResult.value);
+        } else {
+          setWeeklyForecast([]);
+        }
+
+        const nextDetails: WeatherDetails = {
+          precipitationProbability: null,
+          windSpeed: null,
+          windUnit: null,
+          airQuality: null
+        };
+
+        let hasDetails = false;
+
+        if (detailsResult.status === "fulfilled") {
+          nextDetails.precipitationProbability = detailsResult.value.precipitationProbability;
+          nextDetails.windSpeed = detailsResult.value.windSpeed;
+          nextDetails.windUnit = detailsResult.value.windUnit;
+          hasDetails = true;
+        }
+
+        if (airQualityResult.status === "fulfilled") {
+          nextDetails.airQuality = airQualityResult.value;
+          hasDetails = true;
+        }
+
+        setWeatherDetails(hasDetails ? nextDetails : null);
       })
       .finally(() => {
         if (!active) return;
@@ -619,12 +764,6 @@ export default function App() {
             setCompassSize(Math.min(width, height));
           }}
         >
-          {compassBeamStyle ? (
-            <View
-              style={[styles.compassBeam, compassBeamStyle, { borderBottomColor: uiColors.compassBeam }]}
-            />
-          ) : null}
-
           <View style={[styles.compassFace, { transform: [{ rotate: `${compassRotation}deg` }] }]}>
             <View style={styles.compassRing} />
 
@@ -661,28 +800,13 @@ export default function App() {
             ))}
 
             <Text
-              style={[styles.compassLabel, styles.compassLabelTop, { color: "#EF4444", fontSize: 15 }]}
+              style={[
+                styles.compassLabel,
+                compassCardinalStyle?.east ?? styles.compassLabelTop,
+                { color: "#EF4444", fontSize: 15 }
+              ]}
             >
               E
-            </Text>
-            <Text
-              style={[
-                styles.compassLabel,
-                compassCardinalStyle?.south ?? styles.compassLabelRight,
-                { color: uiColors.secondary }
-              ]}
-            >
-              S
-            </Text>
-            <Text style={[styles.compassLabel, styles.compassLabelBottom, { color: uiColors.secondary }]}>W</Text>
-            <Text
-              style={[
-                styles.compassLabel,
-                compassCardinalStyle?.north ?? styles.compassLabelLeft,
-                { color: uiColors.secondary }
-              ]}
-            >
-              N
             </Text>
           </View>
 
@@ -718,27 +842,68 @@ export default function App() {
 
   function renderWeather() {
     return (
-      <View style={styles.center}>
-        <View style={styles.labelRow}>
-          <Ionicons name="cloud-outline" size={20} color={uiColors.iconMuted} />
-          <Text style={[styles.labelText, { color: uiColors.secondary }]}>Current Temperature</Text>
+      <View style={styles.weatherScreen}>
+        <View style={styles.weatherMain}>
+          <View style={styles.weatherIconWrap} accessibilityLabel={weatherIcon.label}>
+            <Ionicons name={weatherIcon.name} size={WEATHER_ICON_SIZE} color={uiColors.primary} />
+          </View>
+          {weatherLoading ? (
+            <View style={styles.weatherStack}>
+              <Text style={[styles.tempText, { color: uiColors.primary }]}>--</Text>
+              <Text style={[styles.weatherDayText, { color: uiColors.secondary }]}>{todayLabel}</Text>
+            </View>
+          ) : weatherError ? (
+            <Text style={[styles.helper, { color: uiColors.muted }]}>{weatherError}</Text>
+          ) : (
+            <View style={styles.weatherStack}>
+              <Pressable
+                onPress={() => setTemperatureUnitPreference((prev) => (prev === "C" ? "F" : "C"))}
+                accessibilityRole="button"
+                accessibilityLabel={`Temperature ${temperatureLabel}. Tap to switch to ${
+                  temperatureUnitPreference === "C" ? "F" : "C"
+                }.`}
+              >
+                <Text style={[styles.tempText, { color: uiColors.primary }]}>{temperatureLabel}</Text>
+              </Pressable>
+              <Text style={[styles.weatherDayText, { color: uiColors.secondary }]}>{todayLabel}</Text>
+            </View>
+          )}
         </View>
 
-        {weatherLoading ? (
-          <Text style={[styles.tempText, { color: uiColors.primary }]}>--</Text>
-        ) : weatherError ? (
-          <Text style={[styles.helper, { color: uiColors.muted }]}>{weatherError}</Text>
-        ) : (
-          <Pressable
-            onPress={() => setTemperatureUnitPreference((prev) => (prev === "C" ? "F" : "C"))}
-            accessibilityRole="button"
-            accessibilityLabel={`Temperature ${temperatureLabel}. Tap to switch to ${
-              temperatureUnitPreference === "C" ? "F" : "C"
-            }.`}
-          >
-            <Text style={[styles.tempText, { color: uiColors.primary }]}>{temperatureLabel}</Text>
-          </Pressable>
-        )}
+        <View style={styles.weatherForecastWrap}>
+          {forecastItems.length ? (
+            <>
+              <View style={styles.forecastRow}>
+                {forecastItems.map((item) => (
+                  <View key={item.key} style={styles.forecastItem}>
+                    <Text style={[styles.forecastDay, { color: uiColors.muted }]}>{item.dayLabel}</Text>
+                    <Text style={[styles.forecastTemp, { color: uiColors.primary }]}>{item.temperature}°</Text>
+                  </View>
+                ))}
+              </View>
+              <View style={styles.weatherStatsRow}>
+                <View style={styles.weatherStatItem}>
+                  <Text style={[styles.weatherStatLabel, { color: uiColors.muted }]}>Precip</Text>
+                  <Text style={[styles.weatherStatValue, { color: uiColors.primary }]}>
+                    {weatherDetailLabels.precipitation}
+                  </Text>
+                </View>
+                <View style={styles.weatherStatItem}>
+                  <Text style={[styles.weatherStatLabel, { color: uiColors.muted }]}>Air Quality</Text>
+                  <Text style={[styles.weatherStatValue, { color: uiColors.primary }]}>
+                    {weatherDetailLabels.airQuality}
+                  </Text>
+                </View>
+                <View style={styles.weatherStatItem}>
+                  <Text style={[styles.weatherStatLabel, { color: uiColors.muted }]}>Wind</Text>
+                  <Text style={[styles.weatherStatValue, { color: uiColors.primary }]}>
+                    {weatherDetailLabels.wind}
+                  </Text>
+                </View>
+              </View>
+            </>
+          ) : null}
+        </View>
       </View>
     );
   }
@@ -966,9 +1131,15 @@ const styles = StyleSheet.create({
 
   safe: { flex: 1, backgroundColor: "transparent" },
 
-  topRow: { paddingHorizontal: 16, paddingTop: 8 },
+  topRow: {
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12
+  },
   locationPill: {
-    alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
@@ -1145,11 +1316,11 @@ const styles = StyleSheet.create({
   },
   compassLabel: {
     position: "absolute",
-    width: 18,
-    height: 18,
+    width: COMPASS_CARDINAL_SIZE,
+    height: COMPASS_CARDINAL_SIZE,
     fontSize: 13,
     fontWeight: "700",
-    lineHeight: 18,
+    lineHeight: COMPASS_CARDINAL_SIZE,
     textAlign: "center",
     textAlignVertical: "center"
   },
@@ -1195,6 +1366,60 @@ const styles = StyleSheet.create({
   },
 
   tempText: { color: "#111111", fontSize: 56, fontWeight: "700" },
+  weatherScreen: {
+    flex: 1,
+    alignItems: "center",
+    width: "100%",
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    position: "relative"
+  },
+  weatherMain: {
+    flex: 1,
+    width: "100%",
+    alignItems: "center",
+    justifyContent: "center",
+    transform: [{ translateY: -24 }],
+    position: "relative"
+  },
+  weatherIconWrap: {
+    position: "absolute",
+    top: "25%",
+    transform: [{ translateY: -(WEATHER_ICON_SIZE / 2) }]
+  },
+  weatherStack: { alignItems: "center" },
+  weatherDayText: { marginTop: 6, fontSize: 14, fontWeight: "700", letterSpacing: 2 },
+  weatherForecastWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: "62%",
+    bottom: 0,
+    justifyContent: "space-evenly",
+    alignItems: "center",
+    paddingHorizontal: 16
+  },
+  forecastRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    width: "100%",
+    maxWidth: 360,
+    alignSelf: "center",
+    flexWrap: "nowrap"
+  },
+  forecastItem: { alignItems: "center", minWidth: 44, flex: 1 },
+  forecastDay: { fontSize: 12, fontWeight: "700", letterSpacing: 1.6 },
+  forecastTemp: { marginTop: 6, fontSize: 18, fontWeight: "700" },
+  weatherStatsRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    width: "100%",
+    maxWidth: 360,
+    alignSelf: "center"
+  },
+  weatherStatItem: { alignItems: "center", flex: 1 },
+  weatherStatLabel: { fontSize: 11, fontWeight: "700", letterSpacing: 1.2 },
+  weatherStatValue: { marginTop: 4, fontSize: 14, fontWeight: "700" },
 
   detailsGrid: {
     width: "100%",
