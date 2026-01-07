@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   KeyboardAvoidingView,
@@ -14,17 +14,26 @@ import {
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { fetchSunTimes } from "./api/sunrise";
 import {
   fetchAirQualityIndex,
-  fetchCurrentTemperature,
-  fetchWeatherDetails,
-  fetchWeeklyForecast,
+  fetchWeatherBundle,
+  getCachedWeather,
+  updateWeatherCache,
   type DailyForecast,
   type WeatherDetails
 } from "./api/weather";
-import { cancelSunriseAlarm, ensureNotificationPermissions, scheduleSunriseAlarm } from "./services/alarm";
+import {
+  cancelSunriseAlarm,
+  ensureNotificationPermissions,
+  initAlarmNotifications,
+  registerAlarmActionListener,
+  scheduleSunriseAlarm
+} from "./services/alarm";
+import { Onboarding } from "./onboarding";
+import { loadHasOnboarded, saveHasOnboarded } from "./services/onboarding";
 import { loadSettings, saveSettings, type SavedLocation } from "./services/storage";
 import { addMinutes, formatTime, formatTimeLabel, formatTimeRange } from "./utils/time";
 
@@ -50,6 +59,7 @@ type Screen = "main" | "weather" | "sun";
 
 export default function App() {
   const [location, setLocation] = useState<SavedLocation>(DEFAULT_LOCATION);
+  const [hasOnboarded, setHasOnboarded] = useState<boolean | null>(null);
   const [sunriseTime, setSunriseTime] = useState<Date | null>(null);
   const [sunsetTime, setSunsetTime] = useState<Date | null>(null);
   const [todaySunrise, setTodaySunrise] = useState<Date | null>(null);
@@ -66,6 +76,7 @@ export default function App() {
   const [temperatureUnit, setTemperatureUnit] = useState<string | null>(null);
   const [temperatureUnitPreference, setTemperatureUnitPreference] = useState<"C" | "F">("F");
   const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherRefreshing, setWeatherRefreshing] = useState(false);
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [weeklyForecast, setWeeklyForecast] = useState<DailyForecast[]>([]);
   const [weatherDetails, setWeatherDetails] = useState<WeatherDetails | null>(null);
@@ -78,6 +89,8 @@ export default function App() {
   const [locationBusy, setLocationBusy] = useState(false);
   const [locationSuggestions, setLocationSuggestions] = useState<SavedLocation[]>([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  // Used so notification action handlers can persist settings without stale closures.
+  const locationRef = useRef(location);
   const canToggle = !!sunriseTime && !loading;
   const canApplyCustom = customLocationQuery.trim().length > 0 && !locationBusy;
   const bgColors = useMemo<readonly [string, string, ...string[]]>(() => {
@@ -437,41 +450,44 @@ export default function App() {
     setLoading(true);
     try {
       const saved = await loadSettings();
+      const onboarded = await loadHasOnboarded();
+      setHasOnboarded(onboarded);
       const nextAlarmEnabled = !!saved?.alarmEnabled;
       setAlarmEnabled(nextAlarmEnabled);
 
       let loc: SavedLocation = saved?.location ?? DEFAULT_LOCATION;
       if (!saved?.location) {
-        let current: SavedLocation | null = null;
-        let currentError: string | null = null;
-        try {
-          current = await getCurrentLocation();
-        } catch (e: any) {
-          currentError = e?.message ?? "Failed to get current location.";
-        }
-
-        if (current) {
-          loc = current;
+        // Before onboarding: do NOT trigger OS location prompt.
+        // Just use default; user can enable on onboarding page 3.
+        if (!onboarded) {
+          loc = DEFAULT_LOCATION;
+          await saveSettings({ alarmEnabled: nextAlarmEnabled, location: loc });
         } else {
-          loc = { ...DEFAULT_LOCATION, label: "Location Off" };
-          if (currentError) {
-            Alert.alert("Location Error", currentError);
-          } else {
-            Alert.alert(
-              "Location Off",
-              "Enable location to get sunrise for your area. Using default location for now."
-            );
-          }
-        }
+          let current: SavedLocation | null = null;
+          let currentError: string | null = null;
 
-        await saveSettings({ alarmEnabled: nextAlarmEnabled, location: loc });
+          try {
+            current = await getCurrentLocation();
+          } catch (e: any) {
+            currentError = e?.message ?? "Failed to get current location.";
+          }
+
+          if (current) {
+            loc = current;
+          } else {
+            loc = { ...DEFAULT_LOCATION, label: "Location Off" };
+            if (currentError) Alert.alert("Location Error", currentError);
+          }
+
+          await saveSettings({ alarmEnabled: nextAlarmEnabled, location: loc });
+        }
       }
 
       setLocation(loc);
       const { sunrise } = await refreshSunTimes(loc);
 
       // If alarm was enabled previously, re-schedule to ensure it's up to date
-      if (nextAlarmEnabled) {
+      if (onboarded && nextAlarmEnabled) {
         await ensureNotificationPermissions();
         await scheduleSunriseAlarm(sunrise);
       }
@@ -582,74 +598,115 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    locationRef.current = location;
+  }, [location]);
+
+  // One-time notifications bootstrap + action handling (Stop / Snooze).
+  useEffect(() => {
+    initAlarmNotifications().catch(() => undefined);
+
+    const unsubscribe = registerAlarmActionListener({
+      onStop: async () => {
+        // "Stop" = turn off the alarm + cancel any scheduled / snoozed notifications.
+        setAlarmEnabled(false);
+        await saveSettings({ alarmEnabled: false, location: locationRef.current });
+      }
+    });
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
     if (screen !== "weather") return;
     let active = true;
+    const controller = new AbortController();
 
-    setWeatherLoading(true);
-    setWeatherError(null);
-    setWeeklyForecast([]);
-    setWeatherDetails(null);
-    setWeatherCode(null);
-    setWeatherIsDay(null);
+    const applyBundle = (bundle: Awaited<ReturnType<typeof fetchWeatherBundle>>, airQuality: number | null) => {
+      setTemperature(bundle.current.temperature);
+      setTemperatureUnit(bundle.current.unit);
+      setWeatherCode(bundle.current.weatherCode);
+      setWeatherIsDay(bundle.current.isDay);
+      setWeeklyForecast(bundle.forecast);
 
-    Promise.allSettled([
-      fetchCurrentTemperature(location.latitude, location.longitude),
-      fetchWeeklyForecast(location.latitude, location.longitude),
-      fetchWeatherDetails(location.latitude, location.longitude),
-      fetchAirQualityIndex(location.latitude, location.longitude)
-    ])
-      .then(([currentResult, forecastResult, detailsResult, airQualityResult]) => {
+      const nextDetails: WeatherDetails = {
+        precipitationProbability: bundle.details.precipitationProbability,
+        windSpeed: bundle.details.windSpeed,
+        windUnit: bundle.details.windUnit,
+        airQuality
+      };
+      setWeatherDetails(nextDetails);
+    };
+
+    const run = async () => {
+      const hasExistingData =
+        temperature !== null || weatherCode !== null || weeklyForecast.length > 0 || weatherDetails !== null;
+
+      // 1) Try cached data first (instant on revisit)
+      const cached = await getCachedWeather(location.latitude, location.longitude);
+      if (!active) return;
+
+      if (cached.bundle) {
+        applyBundle(cached.bundle, cached.airQuality);
+      }
+
+      // If cache is fresh, don't refetch.
+      if (cached.bundle && cached.isFresh) {
+        setWeatherError(null);
+        setWeatherLoading(false);
+        setWeatherRefreshing(false);
+        return;
+      }
+
+      // 2) Fetch latest (don't blank UI; show a lightweight "updating" state)
+      setWeatherError(null);
+      if (cached.bundle || hasExistingData) {
+        setWeatherRefreshing(true);
+      } else {
+        setWeatherLoading(true);
+      }
+
+      const [bundleResult, aqiResult] = await Promise.allSettled([
+        fetchWeatherBundle(location.latitude, location.longitude, { signal: controller.signal }),
+        fetchAirQualityIndex(location.latitude, location.longitude, { signal: controller.signal })
+      ]);
+
+      if (!active) return;
+
+      if (bundleResult.status === "fulfilled") {
+        const bundle = bundleResult.value;
+        const aqi = aqiResult.status === "fulfilled" ? aqiResult.value : null;
+
+        applyBundle(bundle, aqi);
+        await updateWeatherCache(location.latitude, location.longitude, bundle, aqi);
+        setWeatherError(null);
+      } else {
+        // If we have no prior data at all, show the error.
+        if (!cached.bundle && !hasExistingData) {
+          setWeatherError(bundleResult.reason?.message ?? "Failed to load weather.");
+        }
+        // Otherwise keep existing data and silently fail.
+      }
+    };
+
+    run()
+      .catch((e: any) => {
         if (!active) return;
+        if (e?.name === "AbortError") return;
 
-        if (currentResult.status === "fulfilled") {
-          setTemperature(currentResult.value.temperature);
-          setTemperatureUnit(currentResult.value.unit);
-          setWeatherCode(currentResult.value.weatherCode);
-          setWeatherIsDay(currentResult.value.isDay);
-        } else {
-          setWeatherError(currentResult.reason?.message ?? "Failed to load temperature.");
-          setTemperature(null);
-          setTemperatureUnit(null);
-          setWeatherCode(null);
-          setWeatherIsDay(null);
+        // Only surface if we have nothing to show.
+        if (temperature === null && weeklyForecast.length === 0) {
+          setWeatherError(e?.message ?? "Failed to load weather.");
         }
-
-        if (forecastResult.status === "fulfilled") {
-          setWeeklyForecast(forecastResult.value);
-        } else {
-          setWeeklyForecast([]);
-        }
-
-        const nextDetails: WeatherDetails = {
-          precipitationProbability: null,
-          windSpeed: null,
-          windUnit: null,
-          airQuality: null
-        };
-
-        let hasDetails = false;
-
-        if (detailsResult.status === "fulfilled") {
-          nextDetails.precipitationProbability = detailsResult.value.precipitationProbability;
-          nextDetails.windSpeed = detailsResult.value.windSpeed;
-          nextDetails.windUnit = detailsResult.value.windUnit;
-          hasDetails = true;
-        }
-
-        if (airQualityResult.status === "fulfilled") {
-          nextDetails.airQuality = airQualityResult.value;
-          hasDetails = true;
-        }
-
-        setWeatherDetails(hasDetails ? nextDetails : null);
       })
       .finally(() => {
         if (!active) return;
         setWeatherLoading(false);
+        setWeatherRefreshing(false);
       });
 
     return () => {
       active = false;
+      controller.abort();
     };
   }, [screen, location.latitude, location.longitude]);
 
@@ -866,6 +923,9 @@ export default function App() {
                 <Text style={[styles.tempText, { color: uiColors.primary }]}>{temperatureLabel}</Text>
               </Pressable>
               <Text style={[styles.weatherDayText, { color: uiColors.secondary }]}>{todayLabel}</Text>
+              {weatherRefreshing ? (
+                <Text style={[styles.weatherUpdatingText, { color: uiColors.muted }]}>Updating…</Text>
+              ) : null}
             </View>
           )}
         </View>
@@ -979,484 +1039,525 @@ export default function App() {
     );
   }
 
-  return (
-    <LinearGradient
-      colors={bgColors}
-      start={{ x: 0.5, y: 0 }}
-      end={{ x: 0.5, y: 1 }}
-      style={styles.gradient}
-    >
-      <SafeAreaView style={styles.safe}>
-        {/* Top row */}
-        <View style={styles.topRow}>
-          <Pressable onPress={openLocationModal} style={styles.locationPill} accessibilityLabel="Update location">
-            <Ionicons name="location-outline" size={18} color={uiColors.icon} />
-            <Text style={[styles.locationText, { color: uiColors.primary }]} numberOfLines={1}>
-              {location.label}
-            </Text>
-          </Pressable>
-        </View>
-
-        <Modal
-          visible={locationModalOpen}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setLocationModalOpen(false)}
-        >
-          <Pressable style={styles.modalBackdrop} onPress={() => setLocationModalOpen(false)}>
-            <KeyboardAvoidingView
-              behavior={Platform.OS === "ios" ? "padding" : undefined}
-              style={styles.modalKeyboard}
-            >
-              <Pressable style={styles.modalCard} onPress={() => {}}>
-                <Text style={styles.modalTitle}>Location</Text>
-                <Text style={styles.modalSubtitle} numberOfLines={1}>
-                  Current: {location.label}
-                </Text>
-
-                <Text style={styles.modalSection}>Current location</Text>
-                <Pressable
-                  style={[styles.modalPrimaryBtn, locationBusy && styles.modalBtnDisabled]}
-                  onPress={handleUseCurrentLocation}
-                  disabled={locationBusy}
-                  accessibilityLabel="Use current location"
-                >
-                  <Ionicons name="locate-outline" size={18} color="#111111" />
-                  <Text style={styles.modalPrimaryText}>
-                    {locationBusy ? "Working..." : "Use current location"}
-                  </Text>
-                </Pressable>
-
-                <View style={styles.modalDivider} />
-
-                <Text style={styles.modalSection}>Custom location</Text>
-                <TextInput
-                  value={customLocationQuery}
-                  onChangeText={(value) => {
-                    setCustomLocationQuery(value);
-                    if (customLocationError) setCustomLocationError(null);
-                  }}
-                  placeholder="City, address, or lat, lon"
-                  placeholderTextColor="#9CA3AF"
-                  style={styles.modalInput}
-                  autoCapitalize="words"
-                  autoCorrect={false}
-                  editable={!locationBusy}
-                  returnKeyType="done"
-                  onSubmitEditing={handleApplyCustomLocation}
-                />
-                {customLocationError ? <Text style={styles.modalError}>{customLocationError}</Text> : null}
-                {suggestionsLoading ? <Text style={styles.modalHint}>Searching...</Text> : null}
-                {!suggestionsLoading && locationSuggestions.length > 0 ? (
-                  <View style={styles.suggestionList}>
-                    {locationSuggestions.map((item, index) => (
-                      <Pressable
-                        key={`${item.latitude}-${item.longitude}-${index}`}
-                        style={[
-                          styles.suggestionRow,
-                          index === locationSuggestions.length - 1 && styles.suggestionRowLast
-                        ]}
-                        onPress={() => handleSelectSuggestion(item)}
-                        disabled={locationBusy}
-                        accessibilityLabel={`Select ${item.label}`}
-                      >
-                        <Text style={styles.suggestionText}>{item.label}</Text>
-                        <Text style={styles.suggestionSub}>
-                          {item.latitude.toFixed(3)}, {item.longitude.toFixed(3)}
-                        </Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                ) : null}
-
-                <View style={styles.modalActions}>
-                  <Pressable
-                    style={styles.modalBtn}
-                    onPress={() => setLocationModalOpen(false)}
-                    accessibilityLabel="Cancel location update"
-                  >
-                    <Text style={styles.modalBtnText}>Cancel</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[
-                      styles.modalBtn,
-                      styles.modalBtnPrimary,
-                      !canApplyCustom && styles.modalBtnDisabled
-                    ]}
-                    onPress={handleApplyCustomLocation}
-                    disabled={!canApplyCustom}
-                    accessibilityLabel="Save custom location"
-                  >
-                    <Text style={[styles.modalBtnText, styles.modalBtnTextPrimary]}>Save</Text>
-                  </Pressable>
-                </View>
-              </Pressable>
-            </KeyboardAvoidingView>
-          </Pressable>
-        </Modal>
-
-        {screen === "main" ? renderMain() : screen === "weather" ? renderWeather() : renderSunDetails()}
-
-        {/* Bottom nav placeholder */}
-        <View style={styles.bottomNav}>
-          <Pressable
-            style={[styles.navBtn, screen === "weather" && styles.navBtnActive]}
-            onPress={() => setScreen("weather")}
-            accessibilityLabel="Weather"
-          >
-            <Ionicons name="cloud-outline" size={26} color={uiColors.icon} />
-          </Pressable>
-          <Pressable
-            style={[styles.navBtn, screen === "main" && styles.navBtnActive]}
-            onPress={() => setScreen("main")}
-            accessibilityLabel="Alarm"
-          >
-            <Ionicons name="time-outline" size={26} color={uiColors.icon} />
-          </Pressable>
-          <Pressable
-            style={[styles.navBtn, screen === "sun" && styles.navBtnActive]}
-            onPress={() => setScreen("sun")}
-            accessibilityLabel="Sun details"
-          >
-            <Ionicons name="sunny-outline" size={26} color={uiColors.icon} />
-          </Pressable>
-        </View>
-      </SafeAreaView>
-    </LinearGradient>
-  );
-}
-
-const styles = StyleSheet.create({
-  gradient: { flex: 1 },
-
-  safe: { flex: 1, backgroundColor: "transparent" },
-
-  topRow: {
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12
-  },
-  locationPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 999,
-    backgroundColor: "rgba(17, 24, 39, 0.06)"
-  },
-  locationText: { color: "#111111", fontSize: 14, fontWeight: "600", maxWidth: 240 },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(17, 24, 39, 0.35)",
-    padding: 18
-  },
-  modalKeyboard: { flex: 1, justifyContent: "center" },
-  modalCard: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 20,
-    padding: 18
-  },
-  modalTitle: { color: "#111111", fontSize: 18, fontWeight: "700" },
-  modalSubtitle: { color: "#6B7280", fontSize: 13, marginTop: 4, marginBottom: 16 },
-  modalSection: {
-    color: "#374151",
-    fontSize: 12,
-    fontWeight: "600",
-    letterSpacing: 0.6,
-    marginBottom: 8,
-    textTransform: "uppercase"
-  },
-  modalPrimaryBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderRadius: 12,
-    backgroundColor: "rgba(255, 149, 0, 0.18)"
-  },
-  modalPrimaryText: { color: "#111111", fontSize: 15, fontWeight: "600" },
-  modalDivider: { height: 1, backgroundColor: "rgba(17, 24, 39, 0.08)", marginVertical: 16 },
-  modalInput: {
-    borderWidth: 1,
-    borderColor: "rgba(17, 24, 39, 0.12)",
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: "#111111",
-    fontSize: 15,
-    backgroundColor: "#FFFFFF"
-  },
-  modalError: { marginTop: 8, color: "#B91C1C", fontSize: 13 },
-  modalHint: { marginTop: 8, color: "#6B7280", fontSize: 12 },
-  suggestionList: {
-    marginTop: 10,
-    borderWidth: 1,
-    borderColor: "rgba(17, 24, 39, 0.08)",
-    borderRadius: 12,
-    overflow: "hidden"
-  },
-  suggestionRow: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    backgroundColor: "rgba(17, 24, 39, 0.02)",
-    borderBottomWidth: 1,
-    borderBottomColor: "rgba(17, 24, 39, 0.06)"
-  },
-  suggestionRowLast: { borderBottomWidth: 0 },
-  suggestionText: { color: "#111111", fontSize: 14, fontWeight: "600" },
-  suggestionSub: { color: "#6B7280", fontSize: 12, marginTop: 2 },
-  modalActions: { flexDirection: "row", justifyContent: "flex-end", gap: 10, marginTop: 16 },
-  modalBtn: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: "rgba(17, 24, 39, 0.08)"
-  },
-  modalBtnPrimary: { backgroundColor: "#111111" },
-  modalBtnText: { color: "#111111", fontSize: 14, fontWeight: "600" },
-  modalBtnTextPrimary: { color: "#FFFFFF" },
-  modalBtnDisabled: { opacity: 0.6 },
-
-  trackerCard: {
-    width: "100%",
-    maxWidth: 340,
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-    borderRadius: 18,
-    backgroundColor: "rgba(255, 255, 255, 0.5)",
-    marginBottom: 16
-  },
-  trackerHeader: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
-  trackerTitle: { color: "#374151", fontSize: 14, fontWeight: "700" },
-  arcWrapper: { width: "100%", aspectRatio: 2, overflow: "hidden" },
-  sunPathPoint: {
-    position: "absolute",
-    width: 3,
-    height: 3,
-    borderRadius: 999,
-    backgroundColor: "rgba(17, 24, 39, 0.25)"
-  },
-  arcHorizon: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    top: "50%",
-    height: 2,
-    marginTop: -1,
-    backgroundColor: "rgba(17, 24, 39, 0.12)"
-  },
-  horizonLabels: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    top: "50%",
-    marginTop: 6,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    paddingHorizontal: 2
-  },
-  horizonLabelText: { color: "#6B7280", fontSize: 10, fontWeight: "600" },
-  sunDot: {
-    position: "absolute",
-    width: SUN_DOT_SIZE,
-    height: SUN_DOT_SIZE,
-    borderRadius: SUN_DOT_SIZE / 2,
-    backgroundColor: "#FFFFFF",
-    borderWidth: 2,
-    borderColor: "rgba(255, 149, 0, 0.9)"
-  },
-  trackerFooter: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
-  trackerLabel: { color: "#374151", fontSize: 12, fontWeight: "600" },
-
-  center: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 16 },
-  labelRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 18 },
-  labelText: { color: "#374151", fontSize: 16, fontWeight: "600", letterSpacing: 0.2 },
-  timeCircleWrap: {
-    width: "78%",
-    maxWidth: 260,
-    aspectRatio: 1,
-    borderRadius: 999,
-    marginBottom: 22,
-    position: "relative",
-    overflow: "hidden",
-    alignSelf: "center"
-  },
-  compassFace: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    width: "100%",
-    height: "100%",
-    borderRadius: 999
-  },
-  compassRing: {
-    position: "absolute",
-    top: 0,
-    left: 0,
-    width: "100%",
-    height: "100%",
-    borderRadius: 999,
-    backgroundColor: "transparent"
-  },
-  compassTickDot: {
-    position: "absolute",
-    borderRadius: 999
-  },
-  compassDegree: {
-    position: "absolute",
-    width: 28,
-    textAlign: "center",
-    fontSize: 10,
-    fontWeight: "600"
-  },
-  compassLabel: {
-    position: "absolute",
-    width: COMPASS_CARDINAL_SIZE,
-    height: COMPASS_CARDINAL_SIZE,
-    fontSize: 13,
-    fontWeight: "700",
-    lineHeight: COMPASS_CARDINAL_SIZE,
-    textAlign: "center",
-    textAlignVertical: "center"
-  },
-  compassLabelTop: { top: 8, left: "50%", marginLeft: -9 },
-  compassLabelRight: { right: 14, top: "50%", marginTop: -9 },
-  compassLabelBottom: { bottom: 14, left: "50%", marginLeft: -9 },
-  compassLabelLeft: { left: 14, top: "50%", marginTop: -9 },
-  compassBeam: {
-    position: "absolute",
-    top: "50%",
-    left: "50%",
-    width: 0,
-    height: 0,
-    borderLeftColor: "transparent",
-    borderRightColor: "transparent",
-    borderBottomColor: "rgba(56, 189, 248, 0.2)"
-  },
-  timeCircleBackground: {
-    position: "absolute",
-    borderRadius: 999,
-    backgroundColor: "transparent"
-  },
-  timeOverlay: {
-    position: "absolute",
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  timeText: { color: "#111111", fontSize: 56, fontWeight: "700", letterSpacing: -1 },
-  periodText: { color: "#111111", fontSize: 18, fontWeight: "700", marginTop: 4 },
-
-  toggle: {
-    width: 72,
-    height: 40,
-    borderRadius: 999,
-    padding: 4,
-    justifyContent: "center"
-  },
-  toggleKnob: {
-    width: 32,
-    height: 32,
-    borderRadius: 999,
-    backgroundColor: "#FFFFFF"
-  },
-
-  tempText: { color: "#111111", fontSize: 56, fontWeight: "700" },
-  weatherScreen: {
-    flex: 1,
-    alignItems: "center",
-    width: "100%",
-    paddingHorizontal: 16,
-    paddingTop: 12,
-    position: "relative"
-  },
-  weatherMain: {
-    flex: 1,
-    width: "100%",
-    alignItems: "center",
-    justifyContent: "center",
-    transform: [{ translateY: -24 }],
-    position: "relative"
-  },
-  weatherIconWrap: {
-    position: "absolute",
-    top: "25%",
-    transform: [{ translateY: -(WEATHER_ICON_SIZE / 2) }]
-  },
-  weatherStack: { alignItems: "center" },
-  weatherDayText: { marginTop: 6, fontSize: 14, fontWeight: "700", letterSpacing: 2 },
-  weatherForecastWrap: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    top: "62%",
-    bottom: 0,
-    justifyContent: "space-evenly",
-    alignItems: "center",
-    paddingHorizontal: 16
-  },
-  forecastRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    width: "100%",
-    maxWidth: 360,
-    alignSelf: "center",
-    flexWrap: "nowrap"
-  },
-  forecastItem: { alignItems: "center", minWidth: 44, flex: 1 },
-  forecastDay: { fontSize: 12, fontWeight: "700", letterSpacing: 1.6 },
-  forecastTemp: { marginTop: 6, fontSize: 18, fontWeight: "700" },
-  weatherStatsRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    width: "100%",
-    maxWidth: 360,
-    alignSelf: "center"
-  },
-  weatherStatItem: { alignItems: "center", flex: 1 },
-  weatherStatLabel: { fontSize: 11, fontWeight: "700", letterSpacing: 1.2 },
-  weatherStatValue: { marginTop: 4, fontSize: 14, fontWeight: "700" },
-
-  detailsGrid: {
-    width: "100%",
-    maxWidth: 340,
-    gap: 12
-  },
-  detailCardRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    borderRadius: 16,
-    backgroundColor: "rgba(255, 255, 255, 0.5)"
-  },
-  detailLabel: { color: "#374151", fontSize: 13, fontWeight: "700" },
-  detailValue: { color: "#111111", fontSize: 16, fontWeight: "500", textAlign: "right" },
-
-  helper: { marginTop: 14, color: "#6B7280", fontSize: 14, textAlign: "center" },
-
-  bottomNav: {
-    paddingHorizontal: 24,
-    paddingVertical: 16,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    borderTopWidth: 1,
-    borderTopColor: "rgba(17, 24, 39, 0.06)"
-  },
-  navBtn: {
-    width: 56,
-    height: 44,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: 16,
-    backgroundColor: "rgba(17, 24, 39, 0.04)"
-  },
-  navBtnActive: {
-    backgroundColor: "rgba(17, 24, 39, 0.12)"
+  if (hasOnboarded === null) {
+    // simple splash while we load AsyncStorage
+    return (
+      <SafeAreaProvider>
+        <SafeAreaView style={{ flex: 1, backgroundColor: "#FFFFFF" }} />
+      </SafeAreaProvider>
+    );
   }
-});
+
+  if (!hasOnboarded) {
+    return (
+      <SafeAreaProvider>
+        <Onboarding
+          onDone={async () => {
+            await saveHasOnboarded(true);
+            setHasOnboarded(true);
+          }}
+          requestNotifications={async () => {
+            try {
+              await ensureNotificationPermissions();
+              return true;
+            } catch {
+              return false;
+            }
+          }}
+          requestLocation={async () => {
+            // “Forgiving” like your web demo:
+            // If user denies, let them proceed and they can change location later in-app.
+            const current = await getCurrentLocation();
+            if (!current) return true;
+            await applyLocation(current);
+            return true;
+          }}
+        />
+      </SafeAreaProvider>
+    );
+  }
+
+  return (
+    <SafeAreaProvider>
+      <LinearGradient
+        colors={bgColors}
+        start={{ x: 0.5, y: 0 }}
+        end={{ x: 0.5, y: 1 }}
+        style={styles.gradient}
+      >
+        <SafeAreaView style={styles.safe}>
+          {/* Top row */}
+          <View style={styles.topRow}>
+            <Pressable onPress={openLocationModal} style={styles.locationPill} accessibilityLabel="Update location">
+              <Ionicons name="location-outline" size={18} color={uiColors.icon} />
+              <Text style={[styles.locationText, { color: uiColors.primary }]} numberOfLines={1}>
+                {location.label}
+              </Text>
+            </Pressable>
+          </View>
+  
+          <Modal
+            visible={locationModalOpen}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setLocationModalOpen(false)}
+          >
+            <Pressable style={styles.modalBackdrop} onPress={() => setLocationModalOpen(false)}>
+              <KeyboardAvoidingView
+                behavior={Platform.OS === "ios" ? "padding" : undefined}
+                style={styles.modalKeyboard}
+              >
+                <Pressable style={styles.modalCard} onPress={() => {}}>
+                  <Text style={styles.modalTitle}>Location</Text>
+                  <Text style={styles.modalSubtitle} numberOfLines={1}>
+                    Current: {location.label}
+                  </Text>
+  
+                  <Text style={styles.modalSection}>Current location</Text>
+                  <Pressable
+                    style={[styles.modalPrimaryBtn, locationBusy && styles.modalBtnDisabled]}
+                    onPress={handleUseCurrentLocation}
+                    disabled={locationBusy}
+                    accessibilityLabel="Use current location"
+                  >
+                    <Ionicons name="locate-outline" size={18} color="#111111" />
+                    <Text style={styles.modalPrimaryText}>
+                      {locationBusy ? "Working..." : "Use current location"}
+                    </Text>
+                  </Pressable>
+  
+                  <View style={styles.modalDivider} />
+  
+                  <Text style={styles.modalSection}>Custom location</Text>
+                  <TextInput
+                    value={customLocationQuery}
+                    onChangeText={(value) => {
+                      setCustomLocationQuery(value);
+                      if (customLocationError) setCustomLocationError(null);
+                    }}
+                    placeholder="City, address, or lat, lon"
+                    placeholderTextColor="#9CA3AF"
+                    style={styles.modalInput}
+                    autoCapitalize="words"
+                    autoCorrect={false}
+                    editable={!locationBusy}
+                    returnKeyType="done"
+                    onSubmitEditing={handleApplyCustomLocation}
+                  />
+                  {customLocationError ? <Text style={styles.modalError}>{customLocationError}</Text> : null}
+                  {suggestionsLoading ? <Text style={styles.modalHint}>Searching...</Text> : null}
+                  {!suggestionsLoading && locationSuggestions.length > 0 ? (
+                    <View style={styles.suggestionList}>
+                      {locationSuggestions.map((item, index) => (
+                        <Pressable
+                          key={`${item.latitude}-${item.longitude}-${index}`}
+                          style={[
+                            styles.suggestionRow,
+                            index === locationSuggestions.length - 1 && styles.suggestionRowLast
+                          ]}
+                          onPress={() => handleSelectSuggestion(item)}
+                          disabled={locationBusy}
+                          accessibilityLabel={`Select ${item.label}`}
+                        >
+                          <Text style={styles.suggestionText}>{item.label}</Text>
+                          <Text style={styles.suggestionSub}>
+                            {item.latitude.toFixed(3)}, {item.longitude.toFixed(3)}
+                          </Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  ) : null}
+  
+                  <View style={styles.modalActions}>
+                    <Pressable
+                      style={styles.modalBtn}
+                      onPress={() => setLocationModalOpen(false)}
+                      accessibilityLabel="Cancel location update"
+                    >
+                      <Text style={styles.modalBtnText}>Cancel</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[
+                        styles.modalBtn,
+                        styles.modalBtnPrimary,
+                        !canApplyCustom && styles.modalBtnDisabled
+                      ]}
+                      onPress={handleApplyCustomLocation}
+                      disabled={!canApplyCustom}
+                      accessibilityLabel="Save custom location"
+                    >
+                      <Text style={[styles.modalBtnText, styles.modalBtnTextPrimary]}>Save</Text>
+                    </Pressable>
+                  </View>
+                </Pressable>
+              </KeyboardAvoidingView>
+            </Pressable>
+          </Modal>
+  
+          {screen === "main" ? renderMain() : screen === "weather" ? renderWeather() : renderSunDetails()}
+  
+          {/* Bottom nav placeholder */}
+          <View style={styles.bottomNav}>
+            <Pressable
+              style={[styles.navBtn, screen === "weather" && styles.navBtnActive]}
+              onPress={() => setScreen("weather")}
+              accessibilityLabel="Weather"
+            >
+              <Ionicons name="cloud-outline" size={26} color={uiColors.icon} />
+            </Pressable>
+            <Pressable
+              style={[styles.navBtn, screen === "main" && styles.navBtnActive]}
+              onPress={() => setScreen("main")}
+              accessibilityLabel="Alarm"
+            >
+              <Ionicons name="time-outline" size={26} color={uiColors.icon} />
+            </Pressable>
+            <Pressable
+              style={[styles.navBtn, screen === "sun" && styles.navBtnActive]}
+              onPress={() => setScreen("sun")}
+              accessibilityLabel="Sun details"
+            >
+              <Ionicons name="sunny-outline" size={26} color={uiColors.icon} />
+            </Pressable>
+          </View>
+        </SafeAreaView>
+        </LinearGradient>
+      </SafeAreaProvider>
+    );
+  }
+  
+  const styles = StyleSheet.create({
+    gradient: { flex: 1 },
+  
+    safe: { flex: 1, backgroundColor: "transparent" },
+  
+    topRow: {
+      paddingHorizontal: 16,
+      paddingTop: 8,
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12
+    },
+    locationPill: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 999,
+      backgroundColor: "rgba(17, 24, 39, 0.06)"
+    },
+    locationText: { color: "#111111", fontSize: 14, fontWeight: "600", maxWidth: 240 },
+    modalBackdrop: {
+      flex: 1,
+      backgroundColor: "rgba(17, 24, 39, 0.35)",
+      padding: 18
+    },
+    modalKeyboard: { flex: 1, justifyContent: "center" },
+    modalCard: {
+      backgroundColor: "#FFFFFF",
+      borderRadius: 20,
+      padding: 18
+    },
+    modalTitle: { color: "#111111", fontSize: 18, fontWeight: "700" },
+    modalSubtitle: { color: "#6B7280", fontSize: 13, marginTop: 4, marginBottom: 16 },
+    modalSection: {
+      color: "#374151",
+      fontSize: 12,
+      fontWeight: "600",
+      letterSpacing: 0.6,
+      marginBottom: 8,
+      textTransform: "uppercase"
+    },
+    modalPrimaryBtn: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      paddingHorizontal: 14,
+      paddingVertical: 12,
+      borderRadius: 12,
+      backgroundColor: "rgba(255, 149, 0, 0.18)"
+    },
+    modalPrimaryText: { color: "#111111", fontSize: 15, fontWeight: "600" },
+    modalDivider: { height: 1, backgroundColor: "rgba(17, 24, 39, 0.08)", marginVertical: 16 },
+    modalInput: {
+      borderWidth: 1,
+      borderColor: "rgba(17, 24, 39, 0.12)",
+      borderRadius: 12,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      color: "#111111",
+      fontSize: 15,
+      backgroundColor: "#FFFFFF"
+    },
+    modalError: { marginTop: 8, color: "#B91C1C", fontSize: 13 },
+    modalHint: { marginTop: 8, color: "#6B7280", fontSize: 12 },
+    suggestionList: {
+      marginTop: 10,
+      borderWidth: 1,
+      borderColor: "rgba(17, 24, 39, 0.08)",
+      borderRadius: 12,
+      overflow: "hidden"
+    },
+    suggestionRow: {
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      backgroundColor: "rgba(17, 24, 39, 0.02)",
+      borderBottomWidth: 1,
+      borderBottomColor: "rgba(17, 24, 39, 0.06)"
+    },
+    suggestionRowLast: { borderBottomWidth: 0 },
+    suggestionText: { color: "#111111", fontSize: 14, fontWeight: "600" },
+    suggestionSub: { color: "#6B7280", fontSize: 12, marginTop: 2 },
+    modalActions: { flexDirection: "row", justifyContent: "flex-end", gap: 10, marginTop: 16 },
+    modalBtn: {
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 10,
+      backgroundColor: "rgba(17, 24, 39, 0.08)"
+    },
+    modalBtnPrimary: { backgroundColor: "#111111" },
+    modalBtnText: { color: "#111111", fontSize: 14, fontWeight: "600" },
+    modalBtnTextPrimary: { color: "#FFFFFF" },
+    modalBtnDisabled: { opacity: 0.6 },
+  
+    trackerCard: {
+      width: "100%",
+      maxWidth: 340,
+      paddingHorizontal: 16,
+      paddingVertical: 16,
+      borderRadius: 18,
+      backgroundColor: "rgba(255, 255, 255, 0.5)",
+      marginBottom: 16
+    },
+    trackerHeader: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10 },
+    trackerTitle: { color: "#374151", fontSize: 14, fontWeight: "700" },
+    arcWrapper: { width: "100%", aspectRatio: 2, overflow: "hidden" },
+    sunPathPoint: {
+      position: "absolute",
+      width: 3,
+      height: 3,
+      borderRadius: 999,
+      backgroundColor: "rgba(17, 24, 39, 0.25)"
+    },
+    arcHorizon: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      top: "50%",
+      height: 2,
+      marginTop: -1,
+      backgroundColor: "rgba(17, 24, 39, 0.12)"
+    },
+    horizonLabels: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      top: "50%",
+      marginTop: 6,
+      flexDirection: "row",
+      justifyContent: "space-between",
+      paddingHorizontal: 2
+    },
+    horizonLabelText: { color: "#6B7280", fontSize: 10, fontWeight: "600" },
+    sunDot: {
+      position: "absolute",
+      width: SUN_DOT_SIZE,
+      height: SUN_DOT_SIZE,
+      borderRadius: SUN_DOT_SIZE / 2,
+      backgroundColor: "#FFFFFF",
+      borderWidth: 2,
+      borderColor: "rgba(255, 149, 0, 0.9)"
+    },
+    trackerFooter: { flexDirection: "row", justifyContent: "space-between", marginTop: 10 },
+    trackerLabel: { color: "#374151", fontSize: 12, fontWeight: "600" },
+  
+    center: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 16 },
+    labelRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 18 },
+    labelText: { color: "#374151", fontSize: 16, fontWeight: "600", letterSpacing: 0.2 },
+    timeCircleWrap: {
+      width: "78%",
+      maxWidth: 260,
+      aspectRatio: 1,
+      borderRadius: 999,
+      marginBottom: 22,
+      position: "relative",
+      overflow: "hidden",
+      alignSelf: "center"
+    },
+    compassFace: {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      borderRadius: 999
+    },
+    compassRing: {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      borderRadius: 999,
+      backgroundColor: "transparent"
+    },
+    compassTickDot: {
+      position: "absolute",
+      borderRadius: 999
+    },
+    compassDegree: {
+      position: "absolute",
+      width: 28,
+      textAlign: "center",
+      fontSize: 10,
+      fontWeight: "600"
+    },
+    compassLabel: {
+      position: "absolute",
+      width: COMPASS_CARDINAL_SIZE,
+      height: COMPASS_CARDINAL_SIZE,
+      fontSize: 13,
+      fontWeight: "700",
+      lineHeight: COMPASS_CARDINAL_SIZE,
+      textAlign: "center",
+      textAlignVertical: "center"
+    },
+    compassLabelTop: { top: 8, left: "50%", marginLeft: -9 },
+    compassLabelRight: { right: 14, top: "50%", marginTop: -9 },
+    compassLabelBottom: { bottom: 14, left: "50%", marginLeft: -9 },
+    compassLabelLeft: { left: 14, top: "50%", marginTop: -9 },
+    compassBeam: {
+      position: "absolute",
+      top: "50%",
+      left: "50%",
+      width: 0,
+      height: 0,
+      borderLeftColor: "transparent",
+      borderRightColor: "transparent",
+      borderBottomColor: "rgba(56, 189, 248, 0.2)"
+    },
+    timeCircleBackground: {
+      position: "absolute",
+      borderRadius: 999,
+      backgroundColor: "transparent"
+    },
+    timeOverlay: {
+      position: "absolute",
+      alignItems: "center",
+      justifyContent: "center"
+    },
+    timeText: { color: "#111111", fontSize: 56, fontWeight: "700", letterSpacing: -1 },
+    periodText: { color: "#111111", fontSize: 18, fontWeight: "700", marginTop: 4 },
+  
+    toggle: {
+      width: 72,
+      height: 40,
+      borderRadius: 999,
+      padding: 4,
+      justifyContent: "center"
+    },
+    toggleKnob: {
+      width: 32,
+      height: 32,
+      borderRadius: 999,
+      backgroundColor: "#FFFFFF"
+    },
+  
+    tempText: { color: "#111111", fontSize: 56, fontWeight: "700" },
+    weatherScreen: {
+      flex: 1,
+      alignItems: "center",
+      width: "100%",
+      paddingHorizontal: 16,
+      paddingTop: 12,
+      position: "relative"
+    },
+    weatherMain: {
+      flex: 1,
+      width: "100%",
+      alignItems: "center",
+      justifyContent: "center",
+      transform: [{ translateY: -24 }],
+      position: "relative"
+    },
+    weatherIconWrap: {
+      position: "absolute",
+      top: "25%",
+      transform: [{ translateY: -(WEATHER_ICON_SIZE / 2) }]
+    },
+    weatherStack: { alignItems: "center" },
+    weatherDayText: { marginTop: 6, fontSize: 14, fontWeight: "700", letterSpacing: 2 },
+    weatherUpdatingText: { marginTop: 6, fontSize: 12, fontWeight: "600", letterSpacing: 1.4 },
+    weatherForecastWrap: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      top: "62%",
+      bottom: 0,
+      justifyContent: "space-evenly",
+      alignItems: "center",
+      paddingHorizontal: 16
+    },
+    forecastRow: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      width: "100%",
+      maxWidth: 360,
+      alignSelf: "center",
+      flexWrap: "nowrap"
+    },
+    forecastItem: { alignItems: "center", minWidth: 44, flex: 1 },
+    forecastDay: { fontSize: 12, fontWeight: "700", letterSpacing: 1.6 },
+    forecastTemp: { marginTop: 6, fontSize: 18, fontWeight: "700" },
+    weatherStatsRow: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      width: "100%",
+      maxWidth: 360,
+      alignSelf: "center"
+    },
+    weatherStatItem: { alignItems: "center", flex: 1 },
+    weatherStatLabel: { fontSize: 11, fontWeight: "700", letterSpacing: 1.2 },
+    weatherStatValue: { marginTop: 4, fontSize: 14, fontWeight: "700" },
+  
+    detailsGrid: {
+      width: "100%",
+      maxWidth: 340,
+      gap: 12
+    },
+    detailCardRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      paddingHorizontal: 16,
+      paddingVertical: 14,
+      borderRadius: 16,
+      backgroundColor: "rgba(255, 255, 255, 0.5)"
+    },
+    detailLabel: { color: "#374151", fontSize: 13, fontWeight: "700" },
+    detailValue: { color: "#111111", fontSize: 16, fontWeight: "500", textAlign: "right" },
+  
+    helper: { marginTop: 14, color: "#6B7280", fontSize: 14, textAlign: "center" },
+  
+    bottomNav: {
+      paddingHorizontal: 24,
+      paddingVertical: 16,
+      flexDirection: "row",
+      justifyContent: "space-between",
+      borderTopWidth: 1,
+      borderTopColor: "rgba(17, 24, 39, 0.06)"
+    },
+    navBtn: {
+      width: 56,
+      height: 44,
+      alignItems: "center",
+      justifyContent: "center",
+      borderRadius: 16,
+      backgroundColor: "rgba(17, 24, 39, 0.04)"
+    },
+    navBtnActive: {
+      backgroundColor: "rgba(17, 24, 39, 0.12)"
+    }
+  });
