@@ -15,6 +15,7 @@ import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { CompassDial } from "./components/CompassDial";
 
 import { fetchSunTimes } from "./api/sunrise";
 import {
@@ -811,7 +812,7 @@ export default function App() {
       <View style={styles.center}>
         <View style={styles.labelRow}>
           <Ionicons name="sunny-outline" size={20} color={uiColors.iconMuted} />
-          <Text style={[styles.labelText, { color: uiColors.secondary }]}>Sunrise Tomorrow</Text>
+          <Text style={[styles.labelText, { color: uiColors.secondary }]}>Tomorrow's Sunrise</Text>
         </View>
 
         <View
@@ -821,78 +822,56 @@ export default function App() {
             setCompassSize(Math.min(width, height));
           }}
         >
-          <View style={[styles.compassFace, { transform: [{ rotate: `${compassRotation}deg` }] }]}>
-            <View style={styles.compassRing} />
+          <View style={[styles.compassSlot, { width: compassSize, height: compassSize }]}>
+            <CompassDial
+              size={compassSize}
+              outerPadding={22}
+              heading={heading}
+              colors={{
+                minorTick: uiColors.compassMinor,
+                majorTick: uiColors.compassMajor,
+                degreeText: uiColors.muted,
+                cardinalText: uiColors.secondary,
+                northText: "#EF4444",
+                beam: uiColors.compassBeam
+              }}
+            />
 
-            {compassMarks.ticks.map((tick) => (
-              <View
-                key={tick.key}
-                style={[
-                  styles.compassTickDot,
-                  {
-                    left: tick.left,
-                    top: tick.top,
-                    width: tick.size,
-                    height: tick.size,
-                    backgroundColor: tick.major ? uiColors.compassMajor : uiColors.compassMinor
-                  }
-                ]}
-              />
-            ))}
-
-            {compassMarks.labels.map((label) => (
-              <Text
-                key={`deg-${label.deg}`}
-                style={[
-                  styles.compassDegree,
-                  {
-                    left: label.left - 14,
-                    top: label.top - 8,
-                    color: uiColors.muted
-                  }
-                ]}
-              >
-                {label.deg}
-              </Text>
-            ))}
-
-            <Text
-              style={[
-                styles.compassLabel,
-                compassCardinalStyle?.east ?? styles.compassLabelTop,
-                { color: "#EF4444", fontSize: 15 }
-              ]}
-            >
-              E
-            </Text>
-          </View>
-
-          <View style={[styles.timeCircleBackground, compassCenterStyle]} />
-          <View style={[styles.timeOverlay, compassCenterStyle]}>
-            <Text style={[styles.timeText, { color: uiColors.primary }]}>
-              {display ? display.time : loading ? "--:--" : "N/A"}
-            </Text>
-            <Text style={[styles.periodText, { color: uiColors.secondary }]}>{display ? display.period : ""}</Text>
+            <View style={[styles.timeCircle, compassCenterStyle]}>
+              <View style={styles.timeCircleBackground} />
+              <View style={styles.timeOverlay}>
+                <Text style={[styles.timeText, { color: uiColors.primary }]}>
+                  {display ? display.time : loading ? "--:--" : "N/A"}
+                </Text>
+                <Text style={[styles.periodText, { color: uiColors.secondary }]}>
+                  {display ? display.period : ""}
+                </Text>
+              </View>
+            </View>
           </View>
         </View>
 
-        <Pressable
-          onPress={onToggle}
-          disabled={!canToggle}
-          style={[
-            styles.toggle,
-            { backgroundColor: alarmEnabled ? "#FF9500" : "#E5E7EB" },
-            !canToggle && { opacity: 0.6 }
-          ]}
-          accessibilityLabel={alarmEnabled ? "Disable alarm" : "Enable alarm"}
-          accessibilityState={{ disabled: !canToggle }}
-        >
-          <View style={[styles.toggleKnob, { alignSelf: alarmEnabled ? "flex-end" : "flex-start" }]} />
-        </Pressable>
+        <View style={styles.toggleBlock}>
+          <Pressable
+            onPress={onToggle}
+            disabled={!canToggle}
+            style={[
+              styles.toggle,
+              { backgroundColor: alarmEnabled ? "#FF9500" : "#E5E7EB" },
+              !canToggle && { opacity: 0.6 }
+            ]}
+            accessibilityLabel={alarmEnabled ? "Disable alarm" : "Enable alarm"}
+            accessibilityState={{ disabled: !canToggle }}
+          >
+            <View style={[styles.toggleKnob, { alignSelf: alarmEnabled ? "flex-end" : "flex-start" }]} />
+          </Pressable>
 
-        <Text style={[styles.helper, { color: uiColors.muted }]}>
-          {alarmEnabled ? "Alarm enabled - we'll notify you at sunrise." : "Enable to schedule a sunrise notification."}
-        </Text>
+          <Text style={[styles.helper, { color: uiColors.muted }]}>
+            {alarmEnabled
+              ? "Alarm enabled - we'll notify you at sunrise."
+              : "Enable to schedule a sunrise notification."}
+          </Text>
+        </View>
       </View>
     );
   }
@@ -1383,9 +1362,18 @@ export default function App() {
       borderRadius: 999,
       marginBottom: 22,
       position: "relative",
-      overflow: "hidden",
-      alignSelf: "center"
+      overflow: "visible",
+      alignItems: "center",
+      justifyContent: "center"
     },
+    compassSlot: {
+      position: "relative",
+      alignSelf: "center",
+      overflow: "visible",
+      alignItems: "center",
+      justifyContent: "center"
+    },
+    toggleBlock: { alignItems: "center", marginTop: 18 },
     compassFace: {
       position: "absolute",
       top: 0,
@@ -1438,13 +1426,18 @@ export default function App() {
       borderRightColor: "transparent",
       borderBottomColor: "rgba(56, 189, 248, 0.2)"
     },
-    timeCircleBackground: {
+    timeCircle: {
       position: "absolute",
-      borderRadius: 999,
+      alignItems: "center",
+      justifyContent: "center",
+      overflow: "hidden"
+    },
+    timeCircleBackground: {
+      ...StyleSheet.absoluteFillObject,
       backgroundColor: "transparent"
     },
     timeOverlay: {
-      position: "absolute",
+      ...StyleSheet.absoluteFillObject,
       alignItems: "center",
       justifyContent: "center"
     },
